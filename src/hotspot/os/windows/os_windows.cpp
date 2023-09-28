@@ -1161,6 +1161,7 @@ void os::shutdown() {
 
 
 static HANDLE dumpFile = nullptr;
+static void record_eventlog(void* exceptionRecord, void* contextRecord, char* buffer, size_t bufferSize);
 
 // Check if dump file can be created.
 void os::check_dump_limit(char* buffer, size_t buffsz) {
@@ -1196,6 +1197,218 @@ void os::check_dump_limit(char* buffer, size_t buffsz) {
   VMError::record_coredump_status(buffer, status);
 }
 
+/* return exe or dll version resource FileVersion */
+/* currently support VS_FIXEDFILEINFO only        */
+
+static int
+get_module_version(HMODULE hmod, char *buffer, size_t bufferSize)
+{
+  HRSRC   R;
+  HGLOBAL G;
+
+  struct VS_VERSIONINFO {
+    WORD  wLength;
+    WORD  wValueLength;
+    WORD  wType;
+    WCHAR szKey[16];
+    WORD  Padding1;
+    VS_FIXEDFILEINFO V;
+  } *verinfo;
+  
+  WORD v1,v2,v3,v4;
+  v1 = v2 = v3 = v4 = 0;
+  
+  if ((R = ::FindResource(hmod, MAKEINTRESOURCE(VS_VERSION_INFO), RT_VERSION)) != NULL) {
+    if ((G = ::LoadResource(hmod, R)) != NULL) {
+      if ((verinfo = (VS_VERSIONINFO*)::LockResource(G)) != NULL) {
+        if (verinfo->wValueLength != 0) {
+          v1 = HIWORD(verinfo->V.dwFileVersionMS);
+          v2 = LOWORD(verinfo->V.dwFileVersionMS);
+          v3 = HIWORD(verinfo->V.dwFileVersionLS);
+          v4 = LOWORD(verinfo->V.dwFileVersionLS);
+        }
+      }
+    }
+  }
+  return jio_snprintf(buffer, bufferSize, "%hu.%hu.%hu.%hu", v1,v2,v3,v4);
+}
+
+/* return GUID string */
+static int
+get_guid(char *buffer, size_t bufferSize)
+{
+  GUID g = { 0 };
+  HRESULT (WINAPI *_CoCreateGuid)(GUID*) = NULL;
+  *(FARPROC*)&_CoCreateGuid = GetProcAddress(LoadLibrary("OLE32"), "CoCreateGuid");
+  _CoCreateGuid && _CoCreateGuid(&g);
+  return jio_snprintf(
+           buffer,
+           bufferSize, 
+           "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           g.Data1,
+           g.Data2,
+           g.Data3,
+           g.Data4[0], g.Data4[1],
+           g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]
+         );
+}
+
+/* Write Windows Application Error Eventlog */
+
+static DWORD (WINAPI *_GetTimestampForLoadedLibrary)(HMODULE);
+
+static void record_eventlog(void* exceptionRecord, void* contextRecord, char *buffer, size_t bufferSize) {
+  HMODULE exe_mod  = NULL;
+  HMODULE abend_mod = NULL;
+
+  char exe_fullpath[MAX_PATH];
+  char abend_fullpath[MAX_PATH];
+
+  char *exe_filename = NULL;
+  char *abend_filename = NULL;
+  
+  DWORD exe_timestamp = 0;
+  DWORD abend_timestamp = 0;
+  
+  DWORD offset = 0;
+  
+  DWORD ExceptionCode     = exceptionRecord ? ((PEXCEPTION_RECORD)exceptionRecord)->ExceptionCode    : 0;
+  PVOID ExceptionAddress  = exceptionRecord ? ((PEXCEPTION_RECORD)exceptionRecord)->ExceptionAddress : NULL;
+  
+  int len;
+
+  FILETIME CreationTime;
+  FILETIME ExitTime;
+  FILETIME KernelTime;
+  FILETIME UserTime;
+
+  HANDLE hEventLog;
+  const char *padding[13];
+
+  HMODULE dbghelp = os::win32::load_Windows_dll("DBGHELP.DLL", NULL, 0);
+  if (dbghelp == NULL) {
+    error_on_dump_or_eventlog = 1;
+    return;
+  }
+
+  _GetTimestampForLoadedLibrary = CAST_TO_FN_PTR(
+    DWORD(WINAPI*)(HMODULE),
+    ::GetProcAddress(dbghelp, "GetTimestampForLoadedLibrary"));
+
+  if (_GetTimestampForLoadedLibrary == NULL) {
+    error_on_dump_or_eventlog = 1;
+    return;
+  }
+
+  /* collect executable info */
+  
+  exe_mod = ::GetModuleHandle(NULL);
+  ::GetModuleFileName(exe_mod, exe_fullpath, sizeof(exe_fullpath));
+  exe_filename = strrchr(exe_fullpath, '\\') + 1;
+  exe_timestamp = _GetTimestampForLoadedLibrary(exe_mod);
+  
+  /* collect abend address info */
+  
+  if (::GetModuleHandleEx(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          (LPCTSTR)ExceptionAddress, &abend_mod) != FALSE ) {
+    ::GetModuleFileName(abend_mod, abend_fullpath, sizeof(abend_fullpath));
+    abend_filename = strrchr(abend_fullpath, '\\') + 1;
+    abend_timestamp = _GetTimestampForLoadedLibrary(abend_mod);
+    offset = (DWORD)((uintptr_t)ExceptionAddress - (uintptr_t)abend_mod);
+  }
+  else {
+    jio_snprintf(abend_fullpath, sizeof(abend_fullpath), "unknown");
+    abend_filename = abend_fullpath;
+    abend_mod = (HMODULE)INVALID_HANDLE_VALUE;
+  }
+
+  memset(padding, 0, sizeof(padding));
+
+  /* %1 : executable basename */
+  len = jio_snprintf(buffer, bufferSize, "%s", exe_filename) + 1;
+  padding[0] = buffer;
+  buffer += len;  bufferSize -= len;
+
+  /* %2 : executable version */
+  len = get_module_version(exe_mod, buffer, bufferSize) + 1;
+  padding[1] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %3 : executable timestamp */
+  len = jio_snprintf(buffer, bufferSize, "%x", exe_timestamp) + 1;
+  padding[2] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %4 : abend module basename */
+  len = jio_snprintf(buffer, bufferSize, "%s", abend_filename) + 1;
+  padding[3] = buffer;
+  buffer += len;  bufferSize -= len;
+
+  /* %5 : abend module version */
+  len = get_module_version(abend_mod, buffer, bufferSize) + 1;
+  padding[4] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %6 : abend module timestamp */
+  len = jio_snprintf(buffer, bufferSize, "%x", abend_timestamp) + 1;
+  padding[5] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %7 : ExceptionCode */
+  len = jio_snprintf(buffer, bufferSize, "%x", ExceptionCode) + 1;
+  padding[6] = buffer;
+  buffer += len;  bufferSize -= len;
+
+  /* %8 : abend offset */
+  len = jio_snprintf(buffer, bufferSize, "%x", offset) + 1;
+  padding[7] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %9 : ProcessId */
+  len = jio_snprintf(buffer, bufferSize, "%x", GetCurrentProcessId()) + 1;
+  padding[8] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %10 : Process Start time */
+  
+  if (::GetProcessTimes(::GetCurrentProcess(), &CreationTime, &ExitTime, &KernelTime, &UserTime) != FALSE ) {
+    len = jio_snprintf(buffer, bufferSize, "%I64x", CreationTime) + 1;
+  }
+  else {
+    len = jio_snprintf(buffer, bufferSize, "0") + 1;
+  }
+  padding[9] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %11 : Application path */
+  len = jio_snprintf(buffer, bufferSize, exe_fullpath) + 1;
+  padding[10] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  /* %12 : Abend Module path */
+  len = jio_snprintf(buffer, bufferSize, abend_fullpath) + 1;
+  padding[11] = buffer;
+  buffer += len;  bufferSize -= len;
+
+  /* %13 : report id */
+  len = get_guid(buffer, bufferSize) + 1;
+  padding[12] = buffer;
+  buffer += len;  bufferSize -= len;
+  
+  if ((hEventLog = ::RegisterEventSource(NULL, "Application Error")) != NULL) {
+    BOOL b = ::ReportEvent(hEventLog, EVENTLOG_ERROR_TYPE, 100, 1000, NULL, 13, 0, padding, NULL);
+    ::DeregisterEventSource(hEventLog);
+    if (b == FALSE) {
+      error_on_dump_or_eventlog = 1;
+    }
+  }
+  else {
+    error_on_dump_or_eventlog = 1;
+  }
+  return;
+}
+
 void os::abort(bool dump_core, void* siginfo, const void* context) {
   EXCEPTION_POINTERS ep;
   MINIDUMP_EXCEPTION_INFORMATION mei;
@@ -1204,12 +1417,14 @@ void os::abort(bool dump_core, void* siginfo, const void* context) {
   HANDLE hProcess = GetCurrentProcess();
   DWORD processId = GetCurrentProcessId();
   MINIDUMP_TYPE dumpType;
+  static char buffer[O_BUFLEN];
 
   shutdown();
   if (!dump_core || dumpFile == nullptr) {
     if (dumpFile != nullptr) {
       CloseHandle(dumpFile);
     }
+    record_eventlog(siginfo, context, buffer, sizeof(buffer));
     win32::exit_process_or_thread(win32::EPT_PROCESS, 1);
   }
 
@@ -1234,6 +1449,7 @@ void os::abort(bool dump_core, void* siginfo, const void* context) {
     jio_fprintf(stderr, "Call to MiniDumpWriteDump() failed (Error 0x%x)\n", GetLastError());
   }
   CloseHandle(dumpFile);
+  record_eventlog(siginfo, context, buffer, sizeof(buffer));
   win32::exit_process_or_thread(win32::EPT_PROCESS, 1);
 }
 
